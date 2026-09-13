@@ -1,0 +1,33 @@
+# Build trees and local install trees
+/build/
+/build-*/
+/install-tree/
+/out/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+
+# CMake / IDE
+.vs/
+.vscode/
+.idea/
+compile_commands.json
+CMakeUserPresets.json
+
+# Runtime artifacts produced by tests, examples, benchmarks and the CLI
+/runtime/
+*.ccsfwal
+*.ccsfsnap
+*.ccsftmp
+*.log
+
+# Tooling scratch
+/.scratch/

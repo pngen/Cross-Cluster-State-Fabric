@@ -1,0 +1,14 @@
+# Cross-Cluster State Fabric - reference deployment binaries.
+
+add_library(ccsf_app_arguments INTERFACE)
+target_include_directories(ccsf_app_arguments INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(ccsf_coordinator ccsf_coordinator_main.cpp)
+target_link_libraries(ccsf_coordinator PRIVATE cross_cluster_state_fabric ccsf_app_arguments)
+ccsf_apply_warnings(ccsf_coordinator)
+
+add_executable(ccsf_cluster_agent ccsf_cluster_agent_main.cpp)
+target_link_libraries(ccsf_cluster_agent PRIVATE cross_cluster_state_fabric ccsf_app_arguments)
+ccsf_apply_warnings(ccsf_cluster_agent)
+
+install(TARGETS ccsf_coordinator ccsf_cluster_agent RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
