@@ -300,9 +300,18 @@ struct Coordinator::Session {
 };
 
 struct Coordinator::Shared {
-  /// Guards the operation-wait condition variable only.
+  /// Guards the session list and the operation wait.
   std::mutex mutex;
   std::condition_variable condition;
+
+  /// Wakes every controller that awaits an operation. Passing through the
+  /// lock first means a waiter is either still ahead of its check or already
+  /// waiting, so a change is never announced into the gap between the two.
+  void wake() {
+    { std::lock_guard<std::mutex> guard(mutex); }
+    condition.notify_all();
+  }
+
   std::mutex agents_mutex;
   std::map<ClusterId, std::shared_ptr<Session>> agents;
   std::mutex sessions_mutex;
@@ -360,14 +369,21 @@ void Coordinator::request_stop() {
     listener_->close();
   }
   if (shared_ != nullptr) {
-    std::lock_guard<std::mutex> guard(shared_->mutex);
-    for (const std::shared_ptr<Session>& session : shared_->sessions) {
-      // A controller connection is closed by its own handler once its final
-      // response has been written, so a shutdown acknowledgement is never lost.
-      if (session->is_agent && session->connection != nullptr) {
-        session->connection->close();
+    {
+      std::lock_guard<std::mutex> guard(shared_->mutex);
+      for (const std::shared_ptr<Session>& session : shared_->sessions) {
+        // Every session is ended, a controller's as much as an agent's: one
+        // that is left open keeps its handler in a receive and serve() from
+        // returning. A session is interrupted rather than closed. Its own
+        // handler closes it, because a socket closed under a receive another
+        // thread is blocked in resets the connection and the peer loses what
+        // it has not read yet, such as a shutdown acknowledgement.
+        if (session->connection != nullptr) {
+          session->connection->interrupt();
+        }
       }
     }
+    shared_->condition.notify_all();
   }
 }
 
@@ -463,8 +479,11 @@ Result<void> Coordinator::handle_agent_frame(std::shared_ptr<Session> session,
     update.has_capabilities = true;
     update.has_capacity = true;
     update.expected_coordinator_epoch = evidence.expected_coordinator_epoch;
-    auto published = fabric_->publish_cluster_evidence(update);
-    if (!published) {
+    if (evidence.cluster_id != session->cluster_id) {
+      ack.ok = 0;
+      ack.code = ErrorCode::AUTHORITY_NOT_ESTABLISHED;
+      ack.detail = "evidence names a cluster this session did not register";
+    } else if (auto published = fabric_->publish_cluster_evidence(update); !published) {
       ack.ok = 0;
       ack.code = published.error().code;
       ack.detail = published.error().to_string();
@@ -604,7 +623,7 @@ Result<void> Coordinator::handle_agent_frame(std::shared_ptr<Session> session,
     reply.payload = writer.data();
     std::lock_guard<std::mutex> guard(session->send_mutex);
     Status sent = session->connection->send_frame(reply);
-    shared_->condition.notify_all();
+    shared_->wake();
     return sent;
   } else {
     return make_error(ErrorCode::PROTOCOL_UNSUPPORTED, "unexpected agent message type");
@@ -634,7 +653,7 @@ Result<void> Coordinator::handle_agent_frame(std::shared_ptr<Session> session,
     config_.trace(std::string("agent frame ") + to_string(type) + " -> " + to_string(reply_type) +
                   ": " + ack.detail);
   }
-  shared_->condition.notify_all();
+  shared_->wake();
   return Status{};
 }
 
@@ -795,6 +814,20 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
         return authorized.error();
       }
       const TransferAuthorization& auth = authorized.value();
+      // The runtime has already reserved the operation. When its intent cannot
+      // be handed to the destination agent the controller receives an error and
+      // no operation identity, so nothing could ever cancel the reservation: it
+      // is withdrawn here, before the error is reported.
+      const auto withdraw = [this, &auth](Error error) {
+        OperationCancellation cancellation;
+        cancellation.operation_id = auth.operation_id;
+        cancellation.operation_generation = auth.operation_generation;
+        cancellation.expected_coordinator_epoch = auth.coordinator_epoch;
+        cancellation.reason = "the transfer intent could not be delivered";
+        (void)fabric_->cancel_operation(cancellation);
+        shared_->wake();
+        return error;
+      };
       std::shared_ptr<Session> destination;
       std::shared_ptr<Session> source;
       {
@@ -809,8 +842,8 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
         }
       }
       if (destination == nullptr || source == nullptr) {
-        return make_error(ErrorCode::UNKNOWN_CLUSTER,
-                          "the source or destination cluster agent is not connected");
+        return withdraw(make_error(ErrorCode::UNKNOWN_CLUSTER,
+                                   "the source or destination cluster agent is not connected"));
       }
       TransferIntentPayload intent;
       intent.transfer_id = auth.transfer_id;
@@ -856,7 +889,7 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
         std::lock_guard<std::mutex> guard(destination->send_mutex);
         Status sent = destination->connection->send_frame(intent_frame);
         if (!sent) {
-          return sent.error();
+          return withdraw(sent.error());
         }
       }
       detail::encode(body, auth);
@@ -872,7 +905,7 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
         return result.error();
       }
       detail::encode(body, result.value());
-      shared_->condition.notify_all();
+      shared_->wake();
       break;
     }
     case ControlOperation::CANCEL_OPERATION: {
@@ -885,7 +918,7 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
         return result.error();
       }
       detail::encode(body, result.value());
-      shared_->condition.notify_all();
+      shared_->wake();
       break;
     }
     case ControlOperation::QUERY_OPERATION:
@@ -904,6 +937,10 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
       }
       std::unique_lock<std::mutex> guard(shared_->mutex);
       for (;;) {
+        if (shared_->stopping) {
+          return make_error(ErrorCode::SHUTTING_DOWN,
+                            "the coordinator is stopping; the operation was not awaited");
+        }
         auto result = fabric_->query_operation(operation_id);
         if (!result) {
           return result.error();
@@ -1099,10 +1136,14 @@ Result<std::vector<std::byte>> Coordinator::dispatch(ControlOperation operation,
 }
 
 void Coordinator::release_session(const std::shared_ptr<Session>& session) {
+  // The send lock keeps the close away from a frame another handler is writing
+  // to this session, and the session lock keeps it away from a stop that is
+  // interrupting the open sessions: neither may act on a released socket.
+  std::lock_guard<std::mutex> sending(session->send_mutex);
+  std::lock_guard<std::mutex> guard(shared_->mutex);
   if (session->connection != nullptr) {
     session->connection->close();
   }
-  std::lock_guard<std::mutex> guard(shared_->mutex);
   shared_->sessions.erase(
       std::remove(shared_->sessions.begin(), shared_->sessions.end(), session),
       shared_->sessions.end());
@@ -1111,9 +1152,16 @@ void Coordinator::release_session(const std::shared_ptr<Session>& session) {
 Result<void> Coordinator::handle_connection(std::unique_ptr<TcpConnection> connection) {
   auto session = std::make_shared<Session>();
   session->connection = std::move(connection);
+  bool stopping = false;
   {
     std::lock_guard<std::mutex> guard(shared_->mutex);
     shared_->sessions.push_back(session);
+    // A stop that ran before this session was listed could not interrupt it.
+    stopping = shared_->stopping;
+  }
+  if (stopping) {
+    release_session(session);
+    return make_error(ErrorCode::SHUTTING_DOWN, "the coordinator is stopping");
   }
 
   auto first = session->connection->receive_frame(config_.maximum_payload_bytes);
@@ -1123,10 +1171,9 @@ Result<void> Coordinator::handle_connection(std::unique_ptr<TcpConnection> conne
   }
   if (first.value().header.message_type == MessageType::HELLO) {
     auto hello = handle_agent_hello(session, first.value());
-    if (!hello) {
-      return hello.error();
-    }
-    for (;;) {
+    // A session whose registration was refused holds no cluster identity, so
+    // nothing it sends afterwards is heard.
+    while (hello && session->is_agent) {
       auto frame = session->connection->receive_frame(config_.maximum_payload_bytes);
       if (!frame) {
         break;
@@ -1137,13 +1184,22 @@ Result<void> Coordinator::handle_connection(std::unique_ptr<TcpConnection> conne
       }
     }
     if (session->cluster_id.valid()) {
+      // Only this session's own registration is removed: the cluster may have
+      // registered again on a newer session that is still serving it.
       std::lock_guard<std::mutex> guard(shared_->agents_mutex);
-      shared_->agents.erase(session->cluster_id);
+      auto registered = shared_->agents.find(session->cluster_id);
+      if (registered != shared_->agents.end() && registered->second == session) {
+        shared_->agents.erase(registered);
+      }
     }
     release_session(session);
+    if (!hello) {
+      return hello.error();
+    }
     return Status{};
   }
   if (first.value().header.message_type != MessageType::CONTROL_REQUEST) {
+    release_session(session);
     return make_error(ErrorCode::PROTOCOL_UNSUPPORTED,
                       "the first frame must be HELLO or a control request");
   }

@@ -268,3 +268,42 @@ CCSF_CASE(placement, plan_replication_selects_a_legal_destination) {
   ctx.check(explanation.value().render().find("Decision: REPLICATE") != std::string::npos,
             "the explanation states the decision");
 }
+
+CCSF_CASE(placement, the_durability_floor_is_a_hard_gate) {
+  auto world = make_world(base_config(CoordinatorId::from_value(46), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  StateGenerationRecord state;
+  state.state_id = world->state;
+  state.generation = world->generation;
+  state.logical_size = SizeValue::of(1ULL << 30U);
+  state.durability = DurabilityClass::DURABLE;
+  state.registered_at = world->now();
+
+  PlacementRequest request;
+  request.state_id = world->state;
+  request.state_generation = world->generation;
+  request.policy = default_placement_policy(world->ids.take());
+  request.policy.constraints.minimum_durability = DurabilityClass::ARCHIVAL;
+
+  const PlacementCandidate durable =
+      candidate_for(*world, world->cluster_b, world->region_one, FailureDomainId::from_value(2),
+                    ClusterHealthState::HEALTHY);
+  const ConstraintOutcome refused = evaluate_hard_constraints(durable, request, &state);
+  ctx.check(!refused.accepted,
+            "a destination that can only establish DURABLE does not meet an ARCHIVAL floor");
+  ctx.check(std::string(refused.constraint) == "minimum_durability",
+            "the durability floor is the constraint that rejects it");
+
+  PlacementCandidate archival = durable;
+  archival.achievable_durability = ReplicaDurabilityState::ARCHIVAL;
+  ctx.check(evaluate_hard_constraints(archival, request, &state).accepted,
+            "an archival destination meets the ARCHIVAL floor");
+
+  request.policy.constraints.minimum_durability = DurabilityClass::DURABLE;
+  ctx.check(evaluate_hard_constraints(durable, request, &state).accepted,
+            "a durable destination meets a DURABLE floor");
+  PlacementCandidate standard = durable;
+  standard.achievable_durability = ReplicaDurabilityState::STANDARD;
+  ctx.check(!evaluate_hard_constraints(standard, request, &state).accepted,
+            "a standard destination does not meet a DURABLE floor");
+}

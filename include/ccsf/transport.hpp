@@ -10,6 +10,7 @@
 #ifndef CCSF_TRANSPORT_HPP
 #define CCSF_TRANSPORT_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -52,7 +53,16 @@ class TcpConnection {
   /// between frames.
   Result<Frame> receive_frame(std::size_t max_payload = kMaxFramePayloadBytes);
 
+  /// Releases the socket. Only the thread that receives on the connection may
+  /// close it: a socket closed under a receive that another thread is blocked
+  /// in resets the connection, and the peer loses whatever it has not read.
   void close();
+
+  /// Ends the traffic on the connection from any thread and wakes a receive
+  /// another thread is blocked in. The socket itself stays open: the thread
+  /// that owns the connection observes the failure and closes it.
+  void interrupt();
+
   [[nodiscard]] bool valid() const noexcept;
   [[nodiscard]] std::string peer() const;
 
@@ -60,10 +70,10 @@ class TcpConnection {
   explicit TcpConnection(std::uintptr_t handle, std::string peer);
 
  private:
-  [[nodiscard]] std::uintptr_t handle() const noexcept { return handle_; }
+  [[nodiscard]] std::uintptr_t handle() const noexcept { return handle_.load(); }
   friend class TcpListener;
 
-  std::uintptr_t handle_{0};
+  std::atomic<std::uintptr_t> handle_{0};
   std::string peer_;
   std::uint64_t next_sequence_{1};
 };
@@ -86,12 +96,12 @@ class TcpListener {
 
   void close();
   [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
-  [[nodiscard]] bool valid() const noexcept { return handle_ != 0; }
+  [[nodiscard]] bool valid() const noexcept { return handle_.load() != 0; }
 
  private:
   TcpListener(std::uintptr_t handle, std::uint16_t port) : handle_(handle), port_(port) {}
 
-  std::uintptr_t handle_{0};
+  std::atomic<std::uintptr_t> handle_{0};
   std::uint16_t port_{0};
 };
 

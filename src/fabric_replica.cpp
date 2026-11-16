@@ -15,9 +15,9 @@ namespace {
 /// Rejects a replica-directed message whose authority metadata is not current.
 /// The order of checks is fixed and part of the documented error semantics.
 Status guard_replica(const detail::ControlPlane& plane, ReplicaId replica_id,
-                     ReplicaGeneration generation, ClusterIncarnationId incarnation,
-                     WorkerBootId worker_boot, CoordinatorEpoch expected_epoch,
-                     ReplicaRecord* out) {
+                     ReplicaGeneration generation, ClusterId reporter,
+                     ClusterIncarnationId incarnation, WorkerBootId worker_boot,
+                     CoordinatorEpoch expected_epoch, ReplicaRecord* out) {
   const ReplicaRecord* existing = find_replica(plane, replica_id);
   if (existing == nullptr) {
     return make_error(ErrorCode::UNKNOWN_REPLICA, "the replica is not registered");
@@ -55,12 +55,43 @@ Status guard_replica(const detail::ControlPlane& plane, ReplicaId replica_id,
                           " but the replica was written under worker boot " +
                           existing->worker_boot_id.str());
   }
+  // A cluster reports on the replicas it hosts and on no others. Without this
+  // a report that omits the incarnation would be accepted from any cluster.
+  if (reporter.valid() && reporter != existing->location.cluster_id) {
+    return make_error(ErrorCode::AUTHORITY_NOT_ESTABLISHED,
+                      "cluster " + reporter.str() + " reports on replica " +
+                          existing->replica_id.str() + ", which is hosted by cluster " +
+                          existing->location.cluster_id.str());
+  }
   if (existing->is_terminal()) {
     return make_error(ErrorCode::ILLEGAL_TRANSITION,
                       std::string("replica is ") + to_string(existing->lifecycle) +
                           " and accepts no further transitions");
   }
   *out = *existing;
+  return Status{};
+}
+
+/// The operation whose destination is this replica, or none.
+OperationId owning_operation(const detail::ControlPlane& plane, const ReplicaRecord& replica) {
+  const OperationRecord* operation = find_operation(plane, replica.operation_id);
+  if (operation == nullptr || operation->destination_replica != replica.replica_id) {
+    return OperationId{};
+  }
+  return operation->operation_id;
+}
+
+/// A report about a replica advances or fails the operation that owns that
+/// replica and no other. A report that names a different operation is refused
+/// before it can touch an operation whose destination it does not describe.
+Status guard_operation(const detail::ControlPlane& plane, const ReplicaRecord& replica,
+                       OperationId named, OperationId* owner) {
+  *owner = owning_operation(plane, replica);
+  if (named.valid() && named != *owner) {
+    return make_error(ErrorCode::STALE_OPERATION_GENERATION,
+                      "the report names operation " + named.str() +
+                          ", which does not own replica " + replica.replica_id.str());
+  }
   return Status{};
 }
 
@@ -223,8 +254,9 @@ Result<ReplicaRecord> Fabric::record_transfer_progress(const TransferProgress& p
       [&progress](const MutationInputs& inputs, ReplicaRecord* out) -> Status {
         ReplicaRecord replica;
         CCSF_TRY(guard_replica(inputs.plane, progress.replica_id, progress.replica_generation,
-                               progress.cluster_incarnation, progress.worker_boot_id,
-                               progress.expected_coordinator_epoch, &replica));
+                               progress.cluster_id, progress.cluster_incarnation,
+                               progress.worker_boot_id, progress.expected_coordinator_epoch,
+                               &replica));
         if (replica.transfer_id.valid() && progress.transfer_id.valid() &&
             progress.transfer_id != replica.transfer_id) {
           return make_error(ErrorCode::STALE_TRANSFER_GENERATION,
@@ -235,11 +267,8 @@ Result<ReplicaRecord> Fabric::record_transfer_progress(const TransferProgress& p
           return make_error(ErrorCode::STALE_TRANSFER_GENERATION,
                             "progress names a superseded transfer generation");
         }
-        if (replica.operation_id.valid() && progress.operation_id.valid() &&
-            progress.operation_id != replica.operation_id) {
-          return make_error(ErrorCode::STALE_OPERATION_GENERATION,
-                            "progress names an operation that does not own this replica");
-        }
+        OperationId owner;
+        CCSF_TRY(guard_operation(inputs.plane, replica, progress.operation_id, &owner));
         switch (replica.lifecycle) {
           case ReplicaLifecycle::PLANNED:
           case ReplicaLifecycle::RESERVED:
@@ -267,8 +296,10 @@ Result<ReplicaRecord> Fabric::record_transfer_progress(const TransferProgress& p
           revised.last_error = progress.failure_reason;
           ++counters.operations_failed;
           ++counters.replicas_abandoned;
-          if (const OperationRecord* operation =
-                  find_operation(inputs.plane, progress.operation_id);
+          // The operation that owns the abandoned destination ends with it, also
+          // when the report did not name it: left in flight it would hold its
+          // reservation and the state's in-flight slot for ever.
+          if (const OperationRecord* operation = find_operation(inputs.plane, owner);
               operation != nullptr && !operation->is_terminal()) {
             OperationRecord updated = *operation;
             updated.state = OperationState::FAILED;
@@ -283,7 +314,7 @@ Result<ReplicaRecord> Fabric::record_transfer_progress(const TransferProgress& p
         } else {
           revised.lifecycle = ReplicaLifecycle::TRANSFERRING;
           revised.transferred_bytes = SizeValue::of(progress.bytes_transferred);
-          advance_operation(inputs, progress.operation_id, progress.operation_generation,
+          advance_operation(inputs, owner, progress.operation_generation,
                             OperationState::TRANSFERRING, "transfer in progress");
         }
         inputs.mutation.effects.push_back(detail::Effect::put_replica(revised));
@@ -305,7 +336,8 @@ Result<ReplicaRecord> Fabric::record_transfer_completion(const TransferCompletio
       [&completion](const MutationInputs& inputs, ReplicaRecord* out) -> Status {
         ReplicaRecord replica;
         CCSF_TRY(guard_replica(inputs.plane, completion.replica_id, completion.replica_generation,
-                               completion.cluster_incarnation, completion.worker_boot_id,
+                               completion.cluster_id, completion.cluster_incarnation,
+                               completion.worker_boot_id,
                                completion.expected_coordinator_epoch, &replica));
         if (replica.transfer_id.valid() && completion.transfer_id.valid() &&
             completion.transfer_id != replica.transfer_id) {
@@ -317,6 +349,8 @@ Result<ReplicaRecord> Fabric::record_transfer_completion(const TransferCompletio
           return make_error(ErrorCode::STALE_TRANSFER_GENERATION,
                             "completion names a superseded transfer generation");
         }
+        OperationId owner;
+        CCSF_TRY(guard_operation(inputs.plane, replica, completion.operation_id, &owner));
         if (!completion.transfer_complete) {
           return make_error(ErrorCode::TRANSFER_INCOMPLETE,
                             "a transfer completion must assert that the transfer finished");
@@ -387,7 +421,7 @@ Result<ReplicaRecord> Fabric::record_transfer_completion(const TransferCompletio
         revised.integrity = ReplicaIntegrityState::UNVERIFIED;
         revised.lifecycle = ReplicaLifecycle::TRANSFERRED;
         revised.availability = ReplicaAvailabilityState::PRESENT;
-        advance_operation(inputs, completion.operation_id, completion.operation_generation,
+        advance_operation(inputs, owner, completion.operation_generation,
                           OperationState::TRANSFERRED, "transfer complete at the destination");
         inputs.mutation.effects.push_back(detail::Effect::put_replica(revised));
         inputs.mutation.effects.push_back(bump_replica_set_effect(inputs.plane, revised.state_id,
@@ -404,9 +438,11 @@ Result<ReplicaRecord> Fabric::verify_replica(const ReplicaVerification& verifica
       [&verification](const MutationInputs& inputs, ReplicaRecord* out) -> Status {
         ReplicaRecord replica;
         CCSF_TRY(guard_replica(inputs.plane, verification.replica_id,
-                               verification.replica_generation, verification.cluster_incarnation,
-                               verification.worker_boot_id,
+                               verification.replica_generation, verification.cluster_id,
+                               verification.cluster_incarnation, verification.worker_boot_id,
                                verification.expected_coordinator_epoch, &replica));
+        OperationId owner;
+        CCSF_TRY(guard_operation(inputs.plane, replica, verification.operation_id, &owner));
         switch (replica.lifecycle) {
           case ReplicaLifecycle::TRANSFERRED:
           case ReplicaLifecycle::VERIFYING:
@@ -421,6 +457,14 @@ Result<ReplicaRecord> Fabric::verify_replica(const ReplicaVerification& verifica
                                   to_string(replica.lifecycle) +
                                   " cannot be verified before its bytes are present");
         }
+        // A replica that is already a committed member keeps its place when it is
+        // verified again: the verification proves its bytes, it does not take the
+        // replica out of the replica set.
+        const ReplicaLifecycle verified_lifecycle =
+            replica.lifecycle == ReplicaLifecycle::AUTHORITATIVE ||
+                    replica.lifecycle == ReplicaLifecycle::DEGRADED
+                ? replica.lifecycle
+                : ReplicaLifecycle::PREPARED;
         const StateGenerationRecord* state =
             find_state(inputs.plane, replica.state_id, replica.state_generation);
         FabricCounters counters = inputs.plane.counters;
@@ -438,7 +482,7 @@ Result<ReplicaRecord> Fabric::verify_replica(const ReplicaVerification& verifica
         revised.measured_digest = verification.measured_digest;
 
         auto persist_and_fail = [&](ErrorCode code, std::string message) -> Status {
-          advance_operation(inputs, verification.operation_id, verification.operation_generation,
+          advance_operation(inputs, owner, verification.operation_generation,
                             OperationState::FAILED, message.c_str());
           inputs.mutation.effects.push_back(detail::Effect::put_replica(revised));
           inputs.mutation.effects.push_back(bump_replica_set_effect(
@@ -552,10 +596,10 @@ Result<ReplicaRecord> Fabric::verify_replica(const ReplicaVerification& verifica
           revised.compatibility = ReplicaCompatibilityState::COMPATIBLE;
           revised.evidence.compatibility_evidence_present = true;
           revised.evidence.compatibility_generation = requirement.generation;
-          revised.lifecycle = ReplicaLifecycle::PREPARED;
+          revised.lifecycle = verified_lifecycle;
           revised.availability = ReplicaAvailabilityState::PRESENT;
           revised.evidence.revalidation_required = false;
-          advance_operation(inputs, verification.operation_id, verification.operation_generation,
+          advance_operation(inputs, owner, verification.operation_generation,
                             OperationState::PREPARED,
                             "destination prepared under explicit authority");
           inputs.mutation.effects.push_back(detail::Effect::put_replica(revised));
@@ -605,11 +649,11 @@ Result<ReplicaRecord> Fabric::verify_replica(const ReplicaVerification& verifica
         if (descriptor != nullptr) {
           revised.compatibility_descriptor = *descriptor;
         }
-        revised.lifecycle = ReplicaLifecycle::PREPARED;
+        revised.lifecycle = verified_lifecycle;
         revised.availability = ReplicaAvailabilityState::PRESENT;
         revised.evidence.revalidation_required = false;
         revised.evidence.health_generation = HealthGeneration::from_value(next++);
-        advance_operation(inputs, verification.operation_id, verification.operation_generation,
+        advance_operation(inputs, owner, verification.operation_generation,
                           OperationState::PREPARED,
                           "destination prepared under explicit authority");
         inputs.mutation.effects.push_back(detail::Effect::put_replica(revised));
@@ -654,6 +698,12 @@ Result<ReplicaRecord> Fabric::commit_replica(const ReplicaCommit& commit) {
             find_state(inputs.plane, existing->state_id, existing->state_generation);
         if (state == nullptr) {
           return make_error(ErrorCode::UNKNOWN_STATE, "the state generation is not registered");
+        }
+        if (state->lifecycle == StateGenerationLifecycle::HISTORICAL ||
+            state->lifecycle == StateGenerationLifecycle::SUPERSEDED) {
+          return make_error(ErrorCode::STALE_STATE_GENERATION,
+                            "a superseded state generation accepts no new authoritative "
+                            "replica");
         }
         const ClusterRecord* cluster = find_cluster(inputs.plane, existing->location.cluster_id);
         if (cluster == nullptr) {
@@ -733,9 +783,9 @@ Result<ReplicaRecord> Fabric::retire_replica(const ReplicaTransition& transition
       [&transition](const MutationInputs& inputs, ReplicaRecord* out) -> Status {
         ReplicaRecord replica;
         CCSF_TRY(guard_replica(inputs.plane, transition.replica_id,
-                               transition.replica_generation, transition.cluster_incarnation,
-                               transition.worker_boot_id, transition.expected_coordinator_epoch,
-                               &replica));
+                               transition.replica_generation, ClusterId{},
+                               transition.cluster_incarnation, transition.worker_boot_id,
+                               transition.expected_coordinator_epoch, &replica));
         const OwnershipRecord* ownership =
             find_ownership(inputs.plane, replica.state_id, replica.state_generation);
         if (ownership != nullptr && ownership->active &&
@@ -768,9 +818,9 @@ Result<ReplicaRecord> Fabric::quarantine_replica(const ReplicaTransition& transi
       [&transition](const MutationInputs& inputs, ReplicaRecord* out) -> Status {
         ReplicaRecord replica;
         CCSF_TRY(guard_replica(inputs.plane, transition.replica_id,
-                               transition.replica_generation, transition.cluster_incarnation,
-                               transition.worker_boot_id, transition.expected_coordinator_epoch,
-                               &replica));
+                               transition.replica_generation, ClusterId{},
+                               transition.cluster_incarnation, transition.worker_boot_id,
+                               transition.expected_coordinator_epoch, &replica));
         FabricCounters counters = inputs.plane.counters;
         ReplicaRecord revised = replica;
         revised.lifecycle = ReplicaLifecycle::QUARANTINED;
@@ -857,6 +907,15 @@ Result<ReplicaRecord> Fabric::revalidate_replica(const ReplicaTransition& transi
             find_state(inputs.plane, replica.state_id, replica.state_generation);
         if (state == nullptr) {
           return make_error(ErrorCode::UNKNOWN_STATE, "the state generation is not registered");
+        }
+        // Revalidation renews evidence that went stale. It does not undo a
+        // supersession: the replica of a superseded generation stays history.
+        if (replica.lifecycle == ReplicaLifecycle::SUPERSEDED ||
+            state->lifecycle == StateGenerationLifecycle::HISTORICAL ||
+            state->lifecycle == StateGenerationLifecycle::SUPERSEDED) {
+          return make_error(ErrorCode::STALE_STATE_GENERATION,
+                            "the replica belongs to a superseded state generation and cannot "
+                            "be revalidated into authority");
         }
         if (replica.compatibility != ReplicaCompatibilityState::COMPATIBLE) {
           const CompatibilityRequirement requirement{state->compatibility_id,

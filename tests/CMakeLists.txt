@@ -15,6 +15,7 @@ set(CCSF_TEST_SOURCES
   test_placement_economics.cpp
   test_persistence.cpp
   test_transport.cpp
+  test_coordinator.cpp
   test_multiprocess.cpp
   test_splitbrain.cpp
   test_property.cpp

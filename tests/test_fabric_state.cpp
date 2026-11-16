@@ -196,3 +196,82 @@ CCSF_CASE(state, cluster_registration_and_evidence) {
   ctx.check(!epoch_rejected.has_value(), "evidence from a stale epoch is rejected");
   ctx.check(epoch_rejected.error().code == ErrorCode::STALE_EPOCH, "rejected as STALE_EPOCH");
 }
+
+CCSF_CASE(state, a_generation_without_a_content_digest_cannot_be_committed) {
+  auto world = make_world(base_config(CoordinatorId::from_value(8), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+
+  StateGenerationSpec spec;
+  spec.state_id = world->state;
+  spec.generation = world->generation;
+  spec.lineage = LineageId::from_value(world->state.value());
+  spec.logical_size = SizeValue::of(1024);
+  ctx.check(world->fabric->register_state(spec).has_value(),
+            "a generation may be registered before its content digest is known");
+
+  auto committed = world->fabric->commit_state_generation(
+      world->state, world->generation, CommitId::from_value(world->ids.take()));
+  ctx.check(!committed.has_value(),
+            "a generation whose content digest is unknown cannot become current");
+  ctx.check(committed.error().code == ErrorCode::INTEGRITY_UNKNOWN,
+            "reported as INTEGRITY_UNKNOWN");
+  auto staged = world->fabric->query_state(world->state, world->generation);
+  ctx.check(staged.value().lifecycle == StateGenerationLifecycle::STAGED,
+            "the refused generation stays staged");
+
+  spec.content_digest = digest_of("payload");
+  ctx.check(world->fabric->publish_state_generation(spec).has_value(),
+            "the digest is published while the generation is staged");
+  ctx.check(world->fabric
+                ->commit_state_generation(world->state, world->generation,
+                                          CommitId::from_value(world->ids.take()))
+                .has_value(),
+            "the generation commits once its digest is known");
+}
+
+CCSF_CASE(state, a_superseded_generation_cannot_be_committed_again) {
+  auto world = make_world(base_config(CoordinatorId::from_value(9), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "generation-one", 2048).has_value(), "generation one committed");
+  const StateGeneration first = world->generation;
+  const CommitId first_commit = world->fabric->query_state(world->state, first).value().commit;
+
+  StateGenerationSpec spec;
+  spec.state_id = world->state;
+  spec.generation = StateGeneration::from_value(2);
+  spec.lineage = LineageId::from_value(world->state.value());
+  spec.logical_size = SizeValue::of(4096);
+  spec.content_digest = digest_of("generation-two");
+  ctx.check(world->fabric->register_state(spec).has_value(), "second generation registered");
+  ctx.check(world->fabric
+                ->commit_state_generation(world->state, spec.generation,
+                                          CommitId::from_value(world->ids.take()))
+                .has_value(),
+            "second generation committed");
+  world->generation = spec.generation;
+  auto current_replica = seed_replica(*world, world->cluster_b, ReplicaDurabilityState::DURABLE);
+  ctx.check(current_replica.has_value(), "the current generation has an authoritative replica");
+
+  auto recommitted = world->fabric->commit_state_generation(
+      world->state, first, CommitId::from_value(world->ids.take()));
+  ctx.check(!recommitted.has_value(),
+            "a superseded generation cannot become current again under a new commit");
+  ctx.check(recommitted.error().code == ErrorCode::ILLEGAL_TRANSITION,
+            "reported as an illegal transition");
+
+  // A late duplicate of the commit that once made generation one current must
+  // not roll the lineage back either.
+  auto duplicate = world->fabric->commit_state_generation(world->state, first, first_commit);
+  ctx.check(duplicate.has_value(), "the duplicate of an applied commit is acknowledged");
+  ctx.check(duplicate.value().lifecycle == StateGenerationLifecycle::HISTORICAL,
+            "and reports the generation as the history it now is");
+
+  auto lineage = world->fabric->query_lineage(world->state);
+  ctx.check(lineage.value().current_generation == spec.generation,
+            "the newer generation is still the current one");
+  auto replica = world->fabric->query_replica(current_replica.value());
+  ctx.check(replica.value().lifecycle == ReplicaLifecycle::AUTHORITATIVE,
+            "the replica of the current generation keeps its authority");
+  ctx.check(replica_counts_toward_replication_factor(replica.value()),
+            "and still counts toward the replication factor");
+}

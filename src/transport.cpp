@@ -88,29 +88,43 @@ TcpConnection::TcpConnection(std::uintptr_t handle, std::string peer)
 TcpConnection::~TcpConnection() { close(); }
 
 TcpConnection::TcpConnection(TcpConnection&& other) noexcept
-    : handle_(other.handle_), peer_(std::move(other.peer_)), next_sequence_(other.next_sequence_) {
-  other.handle_ = 0;
-}
+    : handle_(other.handle_.exchange(0)),
+      peer_(std::move(other.peer_)),
+      next_sequence_(other.next_sequence_) {}
 
 TcpConnection& TcpConnection::operator=(TcpConnection&& other) noexcept {
   if (this != &other) {
     close();
-    handle_ = other.handle_;
+    handle_.store(other.handle_.exchange(0));
     peer_ = std::move(other.peer_);
     next_sequence_ = other.next_sequence_;
-    other.handle_ = 0;
   }
   return *this;
 }
 
 void TcpConnection::close() {
-  if (handle_ != 0) {
-    close_socket(static_cast<SocketHandle>(handle_));
-    handle_ = 0;
+  const std::uintptr_t handle = handle_.exchange(0);
+  if (handle != 0) {
+    close_socket(static_cast<SocketHandle>(handle));
   }
 }
 
-bool TcpConnection::valid() const noexcept { return handle_ != 0; }
+void TcpConnection::interrupt() {
+  const std::uintptr_t handle = handle_.load();
+  if (handle == 0) {
+    return;
+  }
+#if defined(_WIN32)
+  // A shutdown alone does not wake a receive that is already blocked on
+  // Windows; the pending I/O has to be cancelled as well.
+  ::shutdown(static_cast<SocketHandle>(handle), SD_BOTH);
+  ::CancelIoEx(reinterpret_cast<HANDLE>(handle), nullptr);
+#else
+  ::shutdown(static_cast<SocketHandle>(handle), SHUT_RDWR);
+#endif
+}
+
+bool TcpConnection::valid() const noexcept { return handle_.load() != 0; }
 
 std::string TcpConnection::peer() const { return peer_; }
 
@@ -150,7 +164,8 @@ Result<std::unique_ptr<TcpConnection>> TcpConnection::connect(const std::string&
 }
 
 Status TcpConnection::send_frame(const Frame& frame) {
-  if (handle_ == 0) {
+  const std::uintptr_t handle = handle_.load();
+  if (handle == 0) {
     return make_error(ErrorCode::TRANSPORT_CLOSED, "the connection is closed");
   }
   Frame outgoing = frame;
@@ -163,7 +178,7 @@ Status TcpConnection::send_frame(const Frame& frame) {
     const std::size_t remaining = image.size() - offset;
     const int chunk = remaining > (1U << 20U) ? static_cast<int>(1U << 20U)
                                               : static_cast<int>(remaining);
-    const int written = ::send(static_cast<SocketHandle>(handle_),
+    const int written = ::send(static_cast<SocketHandle>(handle),
                                reinterpret_cast<const char*>(image.data() + offset), chunk, 0);
     if (written <= 0) {
       return transport_error(ErrorCode::TRANSPORT_IO, "send failed");
@@ -174,14 +189,15 @@ Status TcpConnection::send_frame(const Frame& frame) {
 }
 
 Result<Frame> TcpConnection::receive_frame(std::size_t max_payload) {
-  if (handle_ == 0) {
+  const std::uintptr_t handle = handle_.load();
+  if (handle == 0) {
     return make_error(ErrorCode::TRANSPORT_CLOSED, "the connection is closed");
   }
   std::array<std::byte, kFrameHeaderBytes> header_bytes{};
   std::size_t received = 0;
   while (received < header_bytes.size()) {
     const int chunk = static_cast<int>(header_bytes.size() - received);
-    const int read = ::recv(static_cast<SocketHandle>(handle_),
+    const int read = ::recv(static_cast<SocketHandle>(handle),
                             reinterpret_cast<char*>(header_bytes.data() + received), chunk, 0);
     if (read == 0) {
       if (received == 0) {
@@ -211,7 +227,7 @@ Result<Frame> TcpConnection::receive_frame(std::size_t max_payload) {
   std::size_t payload_received = 0;
   while (payload_received < frame.payload.size()) {
     const int chunk = static_cast<int>(frame.payload.size() - payload_received);
-    const int read = ::recv(static_cast<SocketHandle>(handle_),
+    const int read = ::recv(static_cast<SocketHandle>(handle),
                             reinterpret_cast<char*>(frame.payload.data() + payload_received), chunk,
                             0);
     if (read == 0) {
@@ -236,9 +252,9 @@ Result<Frame> TcpConnection::receive_frame(std::size_t max_payload) {
 TcpListener::~TcpListener() { close(); }
 
 void TcpListener::close() {
-  if (handle_ != 0) {
-    close_socket(static_cast<SocketHandle>(handle_));
-    handle_ = 0;
+  const std::uintptr_t handle = handle_.exchange(0);
+  if (handle != 0) {
+    close_socket(static_cast<SocketHandle>(handle));
   }
 }
 
@@ -282,7 +298,8 @@ Result<std::unique_ptr<TcpListener>> TcpListener::bind(const std::string& addres
 }
 
 Result<std::unique_ptr<TcpConnection>> TcpListener::accept() {
-  if (handle_ == 0) {
+  const std::uintptr_t handle = handle_.load();
+  if (handle == 0) {
     return make_error(ErrorCode::TRANSPORT_CLOSED, "the listener is closed");
   }
   sockaddr_in remote{};
@@ -291,7 +308,7 @@ Result<std::unique_ptr<TcpConnection>> TcpListener::accept() {
 #else
   socklen_t remote_length = sizeof(remote);
 #endif
-  const SocketHandle accepted = ::accept(static_cast<SocketHandle>(handle_),
+  const SocketHandle accepted = ::accept(static_cast<SocketHandle>(handle),
                                          reinterpret_cast<sockaddr*>(&remote), &remote_length);
   if (accepted == kInvalidSocket) {
     return make_error(ErrorCode::TRANSPORT_CLOSED, "the listener stopped accepting");

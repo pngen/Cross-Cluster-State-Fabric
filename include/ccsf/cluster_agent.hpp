@@ -15,6 +15,8 @@
 #ifndef CCSF_CLUSTER_AGENT_HPP
 #define CCSF_CLUSTER_AGENT_HPP
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -110,7 +112,7 @@ class ClusterAgent {
 
   Result<void> connect_and_register();
   void data_loop();
-  void handle_data_connection(std::unique_ptr<TcpConnection> connection);
+  void handle_data_connection(TcpConnection& connection);
   Result<void> handle_transfer_intent(const Frame& frame);
   /// Reads frames until the expected acknowledgement arrives. Bounded: an
   /// unexpected flood is a protocol violation, not a reason to block forever.
@@ -126,13 +128,17 @@ class ClusterAgent {
   WorkerBootId worker_boot_id_;
   CoordinatorEpoch coordinator_epoch_;
   bool registered_{false};
-  bool stopping_{false};
+  std::atomic<bool> stopping_{false};
 
   ReplicaStore store_;
   mutable std::mutex error_mutex_;
   std::string last_error_;
   std::mutex send_mutex_;
   mutable std::mutex thread_mutex_;
+  /// Data connections that are being served, and the signal that the last of
+  /// them has ended. Guarded by thread_mutex_.
+  std::vector<std::shared_ptr<TcpConnection>> open_data_connections_;
+  std::condition_variable data_idle_;
   std::uintptr_t data_thread_{0};
   std::uint64_t data_connections_{0};
   std::size_t active_data_connections_{0};

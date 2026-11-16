@@ -209,3 +209,189 @@ CCSF_CASE(authority, historical_generation_is_not_current_authority) {
   ctx.check(reuse.value().code == ErrorCode::STALE_STATE_GENERATION,
             "reported as a stale state generation");
 }
+
+CCSF_CASE(authority, reverifying_an_authoritative_replica_keeps_its_authority) {
+  auto world = make_world(base_config(CoordinatorId::from_value(15), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "payload", 2048).has_value(), "state committed");
+  auto seeded = seed_replica(*world, world->cluster_a, ReplicaDurabilityState::DURABLE);
+  ctx.check(seeded.has_value(), "an authoritative replica is seeded in cluster A");
+
+  ReplicaVerification verification;
+  verification.replica_id = seeded.value();
+  verification.cluster_id = world->cluster_a;
+  verification.expected_coordinator_epoch = world->epoch();
+  verification.integrity_verified = true;
+  verification.measured_digest = digest_of("payload");
+  verification.compatibility_verified = true;
+  verification.established_durability = DurabilityClass::DURABLE;
+  verification.verified_bytes = 2048;
+  auto verified = world->fabric->verify_replica(verification);
+  ctx.check(verified.has_value(), "a committed replica can be verified again");
+  ctx.check(verified.value().lifecycle == ReplicaLifecycle::AUTHORITATIVE,
+            "a successful verification leaves a committed replica authoritative");
+  ctx.check(replica_counts_toward_replication_factor(verified.value()),
+            "the replica still counts toward the replication factor");
+
+  auto set = world->fabric->query_replica_set(world->state, world->generation);
+  ctx.check(set.value().authoritative_count == 1U, "the replica set still holds its member");
+  auto reuse = world->fabric->evaluate_reuse(world->state, world->generation, world->cluster_a);
+  ctx.check(reuse.value().decision != DecisionKind::REJECT,
+            "the verified replica still serves reuse");
+}
+
+CCSF_CASE(authority, a_superseded_replica_cannot_be_revalidated_into_authority) {
+  auto world = make_world(base_config(CoordinatorId::from_value(16), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "generation-one", 1024).has_value(), "first generation");
+  auto seeded = seed_replica(*world, world->cluster_a, ReplicaDurabilityState::DURABLE);
+  ctx.check(seeded.has_value(), "first generation has an authoritative replica");
+  const StateGeneration first = world->generation;
+
+  StateGenerationSpec spec;
+  spec.state_id = world->state;
+  spec.generation = StateGeneration::from_value(2);
+  spec.lineage = LineageId::from_value(world->state.value());
+  spec.logical_size = SizeValue::of(2048);
+  spec.content_digest = digest_of("generation-two");
+  ctx.check(world->fabric->register_state(spec).has_value(), "second generation registered");
+  ctx.check(world->fabric
+                ->commit_state_generation(world->state, spec.generation,
+                                          CommitId::from_value(world->ids.take()))
+                .has_value(),
+            "second generation committed");
+
+  ReplicaTransition transition;
+  transition.replica_id = seeded.value();
+  transition.expected_coordinator_epoch = world->epoch();
+  transition.reason = "evidence sweep";
+  auto revalidated = world->fabric->revalidate_replica(transition);
+  ctx.check(!revalidated.has_value(),
+            "revalidation cannot restore the authority of a superseded replica");
+  ctx.check(revalidated.error().code == ErrorCode::STALE_STATE_GENERATION,
+            "reported as a stale state generation");
+
+  auto record = world->fabric->query_replica(seeded.value());
+  ctx.check(record.value().lifecycle == ReplicaLifecycle::SUPERSEDED,
+            "the replica stays superseded");
+  ctx.check(record.value().authority == ReplicaAuthorityState::HISTORICAL,
+            "its authority stays historical");
+  ctx.check(!replica_counts_toward_replication_factor(record.value()),
+            "it does not count toward the replication factor");
+  auto set = world->fabric->query_replica_set(world->state, first);
+  ctx.check(set.value().authoritative_count == 0U,
+            "the superseded generation regains no authoritative member");
+}
+
+CCSF_CASE(authority, a_report_from_a_cluster_that_does_not_host_the_replica_is_refused) {
+  auto world = make_world(base_config(CoordinatorId::from_value(17), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "payload", 2048).has_value(), "state committed");
+
+  ReplicaRegistration registration;
+  registration.state_id = world->state;
+  registration.state_generation = world->generation;
+  registration.location.cluster_id = world->cluster_a;
+  registration.lifecycle = ReplicaLifecycle::TRANSFERRING;
+  registration.expected_coordinator_epoch = world->epoch();
+  auto registered = world->fabric->register_replica(registration);
+  ctx.check(registered.has_value(), "a staging replica registers in cluster A");
+
+  TransferCompletion completion;
+  completion.replica_id = registered.value().replica_id;
+  completion.replica_generation = registered.value().replica_generation;
+  completion.cluster_id = world->cluster_b;
+  completion.expected_coordinator_epoch = world->epoch();
+  completion.bytes_transferred = 2048;
+  completion.measured_digest = digest_of("payload");
+  auto foreign_completion = world->fabric->record_transfer_completion(completion);
+  ctx.check(!foreign_completion.has_value(),
+            "a completion reported by a cluster that does not host the replica is refused");
+  ctx.check(foreign_completion.error().code == ErrorCode::AUTHORITY_NOT_ESTABLISHED,
+            "reported as AUTHORITY_NOT_ESTABLISHED");
+  ctx.check(world->fabric->query_replica(registered.value().replica_id).value().lifecycle ==
+                ReplicaLifecycle::TRANSFERRING,
+            "the refused completion changes nothing");
+
+  completion.cluster_id = world->cluster_a;
+  ctx.check(world->fabric->record_transfer_completion(completion).has_value(),
+            "the hosting cluster reports the completion");
+
+  ReplicaVerification verification;
+  verification.replica_id = registered.value().replica_id;
+  verification.replica_generation = registered.value().replica_generation;
+  verification.cluster_id = world->cluster_b;
+  verification.expected_coordinator_epoch = world->epoch();
+  verification.integrity_verified = true;
+  verification.measured_digest = digest_of("payload");
+  auto foreign_verification = world->fabric->verify_replica(verification);
+  ctx.check(!foreign_verification.has_value(),
+            "a verification reported by a cluster that does not host the replica is refused");
+  ctx.check(world->fabric->query_replica(registered.value().replica_id).value().integrity !=
+                ReplicaIntegrityState::VERIFIED,
+            "the replica is not verified by another cluster's report");
+}
+
+CCSF_CASE(authority, a_superseded_generation_accepts_no_new_authoritative_replica) {
+  auto world = make_world(base_config(CoordinatorId::from_value(18), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "generation-one", 1024).has_value(), "first generation");
+  ctx.check(seed_replica(*world, world->cluster_a, ReplicaDurabilityState::DURABLE).has_value(),
+            "first generation has an authoritative replica");
+  const StateGeneration first = world->generation;
+
+  // A second copy of generation one is prepared, but not committed yet.
+  ReplicaRegistration registration;
+  registration.state_id = world->state;
+  registration.state_generation = first;
+  registration.location.cluster_id = world->cluster_b;
+  registration.lifecycle = ReplicaLifecycle::TRANSFERRING;
+  registration.expected_coordinator_epoch = world->epoch();
+  auto registered = world->fabric->register_replica(registration);
+  ctx.check(registered.has_value(), "a second copy registers in cluster B");
+  TransferCompletion completion;
+  completion.replica_id = registered.value().replica_id;
+  completion.replica_generation = registered.value().replica_generation;
+  completion.cluster_id = world->cluster_b;
+  completion.expected_coordinator_epoch = world->epoch();
+  completion.bytes_transferred = 1024;
+  completion.measured_digest = digest_of("generation-one");
+  ctx.check(world->fabric->record_transfer_completion(completion).has_value(), "bytes transferred");
+  ReplicaVerification verification;
+  verification.replica_id = registered.value().replica_id;
+  verification.replica_generation = registered.value().replica_generation;
+  verification.cluster_id = world->cluster_b;
+  verification.expected_coordinator_epoch = world->epoch();
+  verification.integrity_verified = true;
+  verification.measured_digest = digest_of("generation-one");
+  ctx.check(world->fabric->verify_replica(verification).has_value(), "the copy is prepared");
+
+  StateGenerationSpec spec;
+  spec.state_id = world->state;
+  spec.generation = StateGeneration::from_value(2);
+  spec.lineage = LineageId::from_value(world->state.value());
+  spec.logical_size = SizeValue::of(2048);
+  spec.content_digest = digest_of("generation-two");
+  ctx.check(world->fabric->register_state(spec).has_value(), "second generation registered");
+  ctx.check(world->fabric
+                ->commit_state_generation(world->state, spec.generation,
+                                          CommitId::from_value(world->ids.take()))
+                .has_value(),
+            "second generation committed");
+
+  ReplicaCommit commit;
+  commit.replica_id = registered.value().replica_id;
+  commit.commit_id = CommitId::from_value(world->ids.take());
+  commit.expected_coordinator_epoch = world->epoch();
+  auto committed = world->fabric->commit_replica(commit);
+  ctx.check(!committed.has_value(),
+            "a replica of a superseded generation cannot be committed as authoritative");
+  ctx.check(committed.error().code == ErrorCode::STALE_STATE_GENERATION,
+            "reported as a stale state generation");
+  auto record = world->fabric->query_replica(registered.value().replica_id);
+  ctx.check(!replica_counts_toward_replication_factor(record.value()),
+            "the replica does not count toward the replication factor");
+  auto set = world->fabric->query_replica_set(world->state, first);
+  ctx.check(set.value().authoritative_count == 0U,
+            "the superseded generation gains no authoritative member");
+}

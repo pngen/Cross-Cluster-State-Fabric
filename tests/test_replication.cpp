@@ -254,3 +254,108 @@ CCSF_CASE(replication, under_replication_is_explicit) {
   ctx.check(reconciliation.value().replica_set.state == ReplicaSetState::UNDER_REPLICATED,
             "the replica set state is explicitly under replicated");
 }
+
+CCSF_CASE(replication, a_failed_transfer_fails_the_operation_that_owns_the_destination) {
+  auto world = make_world(base_config(CoordinatorId::from_value(25), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "payload", 1024).has_value(), "state committed");
+  ctx.check(seed_replica(*world, world->cluster_a, ReplicaDurabilityState::DURABLE).has_value(),
+            "seeded");
+
+  ReplicationRequest request;
+  request.state_id = world->state;
+  request.state_generation = world->generation;
+  request.destination_cluster = world->cluster_b;
+  request.expected_coordinator_epoch = world->epoch();
+  auto authorization = world->fabric->authorize_replication(request);
+  ctx.check(authorization.has_value(), "the replication is authorized");
+  const TransferAuthorization auth = authorization.value();
+
+  // The failure report names the destination replica but not the operation.
+  TransferProgress failure;
+  failure.replica_id = auth.destination_replica;
+  failure.replica_generation = auth.destination_replica_generation;
+  failure.cluster_id = auth.destination_cluster;
+  failure.cluster_incarnation = auth.destination_incarnation;
+  failure.expected_coordinator_epoch = world->epoch();
+  failure.failed = true;
+  failure.failure_reason = "the source closed the connection";
+  auto reported = world->fabric->record_transfer_progress(failure);
+  ctx.check(!reported.has_value(), "the failure is reported as an error");
+  ctx.check(reported.error().code == ErrorCode::TRANSFER_FAILED, "reported as TRANSFER_FAILED");
+
+  auto destination = world->fabric->query_replica(auth.destination_replica);
+  ctx.check(destination.value().lifecycle == ReplicaLifecycle::ABANDONED,
+            "the destination is abandoned");
+  auto operation = world->fabric->query_operation(auth.operation_id);
+  ctx.check(operation.value().state == OperationState::FAILED,
+            "the operation that owns the abandoned destination is failed, not left in flight");
+}
+
+CCSF_CASE(replication, a_report_cannot_touch_an_operation_that_does_not_own_the_replica) {
+  auto world = make_world(base_config(CoordinatorId::from_value(26), ClusterId::from_value(100)));
+  ctx.check(world != nullptr, "world");
+  ctx.check(publish_state(*world, "payload", 1024, ConsistencyMode::IMMUTABLE, 3).has_value(),
+            "state committed");
+  ctx.check(seed_replica(*world, world->cluster_a, ReplicaDurabilityState::DURABLE).has_value(),
+            "seeded");
+
+  ReplicationRequest request;
+  request.state_id = world->state;
+  request.state_generation = world->generation;
+  request.destination_cluster = world->cluster_b;
+  request.expected_coordinator_epoch = world->epoch();
+  auto first = world->fabric->authorize_replication(request);
+  ctx.check(first.has_value(), "the first replication is authorized");
+  request.destination_cluster = world->cluster_c;
+  auto second = world->fabric->authorize_replication(request);
+  ctx.check(second.has_value(), "the second replication is authorized");
+
+  // A completion for the first destination that names the second operation.
+  TransferCompletion completion;
+  completion.replica_id = first.value().destination_replica;
+  completion.replica_generation = first.value().destination_replica_generation;
+  completion.transfer_id = first.value().transfer_id;
+  completion.transfer_generation = first.value().transfer_generation;
+  completion.operation_id = second.value().operation_id;
+  completion.operation_generation = second.value().operation_generation;
+  completion.cluster_id = first.value().destination_cluster;
+  completion.cluster_incarnation = first.value().destination_incarnation;
+  completion.expected_coordinator_epoch = world->epoch();
+  completion.bytes_transferred = 1024;
+  completion.measured_digest = digest_of("payload");
+  auto misaddressed = world->fabric->record_transfer_completion(completion);
+  ctx.check(!misaddressed.has_value(),
+            "a completion naming an operation that does not own the replica is refused");
+  ctx.check(misaddressed.error().code == ErrorCode::STALE_OPERATION_GENERATION,
+            "reported as STALE_OPERATION_GENERATION");
+  ctx.check(world->fabric->query_operation(second.value().operation_id).value().state ==
+                OperationState::RESERVED,
+            "the other operation is not advanced");
+
+  completion.operation_id = first.value().operation_id;
+  completion.operation_generation = first.value().operation_generation;
+  ctx.check(world->fabric->record_transfer_completion(completion).has_value(),
+            "the completion is accepted for the operation that owns the replica");
+
+  // A failed verification of the first destination that names the second
+  // operation must not end the second operation.
+  ReplicaVerification verification;
+  verification.replica_id = first.value().destination_replica;
+  verification.replica_generation = first.value().destination_replica_generation;
+  verification.operation_id = second.value().operation_id;
+  verification.operation_generation = second.value().operation_generation;
+  verification.cluster_id = first.value().destination_cluster;
+  verification.cluster_incarnation = first.value().destination_incarnation;
+  verification.expected_coordinator_epoch = world->epoch();
+  verification.integrity_verified = false;
+  auto misverified = world->fabric->verify_replica(verification);
+  ctx.check(!misverified.has_value(), "the misaddressed verification is refused");
+  ctx.check(misverified.error().code == ErrorCode::STALE_OPERATION_GENERATION,
+            "reported as STALE_OPERATION_GENERATION");
+  ctx.check(!world->fabric->query_operation(second.value().operation_id).value().is_terminal(),
+            "the other operation is still in flight");
+  ctx.check(world->fabric->query_replica(first.value().destination_replica).value().lifecycle ==
+                ReplicaLifecycle::TRANSFERRED,
+            "the refused verification leaves the replica as it was");
+}

@@ -313,3 +313,130 @@ CCSF_CASE(migration, cancellation_after_commit_cannot_undo_authority) {
   ctx.check(set.value().replica_set.authoritative_count == 2,
             "the committed replica still counts");
 }
+
+namespace {
+
+struct HandedOver {
+  std::unique_ptr<World> world;
+  ReplicaId previous_owner;
+  ReplicaId current_owner;
+};
+
+/// A single-writer state whose ownership has moved from cluster A to cluster B.
+/// The previous owner keeps a committed, verified copy without ownership.
+HandedOver hand_ownership_from_a_to_b(CaseContext& ctx, std::uint64_t coordinator) {
+  HandedOver result;
+  result.world =
+      make_world(base_config(CoordinatorId::from_value(coordinator), ClusterId::from_value(100)));
+  ctx.check(result.world != nullptr, "world");
+  World& world = *result.world;
+  ctx.check(publish_state(world, "payload", 4096, ConsistencyMode::SINGLE_WRITER, 1).has_value(),
+            "a single-writer state is committed");
+  auto seeded = seed_replica(world, world.cluster_a, ReplicaDurabilityState::DURABLE, true);
+  ctx.check(seeded.has_value(), "cluster A holds the authoritative owner replica");
+
+  ReplicaRegistration plain;
+  plain.state_id = world.state;
+  plain.state_generation = world.generation;
+  plain.location.cluster_id = world.cluster_b;
+  plain.lifecycle = ReplicaLifecycle::TRANSFERRING;
+  plain.expected_coordinator_epoch = world.epoch();
+  auto registered = world.fabric->register_replica(plain);
+  ctx.check(registered.has_value(), "a second copy is registered in cluster B");
+  TransferCompletion completion;
+  completion.replica_id = registered.value().replica_id;
+  completion.replica_generation = registered.value().replica_generation;
+  completion.cluster_id = world.cluster_b;
+  completion.expected_coordinator_epoch = world.epoch();
+  completion.bytes_transferred = 4096;
+  completion.measured_digest = digest_of("payload");
+  ctx.check(world.fabric->record_transfer_completion(completion).has_value(), "bytes transferred");
+  ReplicaVerification verification;
+  verification.replica_id = registered.value().replica_id;
+  verification.replica_generation = registered.value().replica_generation;
+  verification.cluster_id = world.cluster_b;
+  verification.expected_coordinator_epoch = world.epoch();
+  verification.integrity_verified = true;
+  verification.measured_digest = digest_of("payload");
+  ctx.check(world.fabric->verify_replica(verification).has_value(), "destination verified");
+
+  OwnershipTransferRequest handoff;
+  handoff.state_id = world.state;
+  handoff.state_generation = world.generation;
+  handoff.expected_current_owner = seeded.value();
+  handoff.new_owner_replica = registered.value().replica_id;
+  handoff.new_owner_cluster = world.cluster_b;
+  handoff.handoff_commit = CommitId::from_value(world.ids.take());
+  handoff.expected_coordinator_epoch = world.epoch();
+  ctx.check(world.fabric->transfer_ownership(handoff).has_value(),
+            "ownership moves to cluster B");
+  result.previous_owner = seeded.value();
+  result.current_owner = registered.value().replica_id;
+  return result;
+}
+
+OwnershipTransferRequest hand_back(HandedOver& run) {
+  World& world = *run.world;
+  OwnershipTransferRequest back;
+  back.state_id = world.state;
+  back.state_generation = world.generation;
+  back.expected_current_owner = run.current_owner;
+  back.new_owner_replica = run.previous_owner;
+  back.new_owner_cluster = world.cluster_a;
+  back.handoff_commit = CommitId::from_value(world.ids.take());
+  back.expected_coordinator_epoch = world.epoch();
+  return back;
+}
+
+}  // namespace
+
+CCSF_CASE(migration, ownership_cannot_be_handed_to_a_retired_replica) {
+  HandedOver run = hand_ownership_from_a_to_b(ctx, 35);
+  World& world = *run.world;
+
+  ReplicaTransition retire;
+  retire.replica_id = run.previous_owner;
+  retire.expected_coordinator_epoch = world.epoch();
+  retire.reason = "decommissioned";
+  ctx.check(world.fabric->retire_replica(retire).has_value(), "the previous owner is retired");
+
+  auto refused = world.fabric->transfer_ownership(hand_back(run));
+  ctx.check(!refused.has_value(), "ownership cannot be handed to a retired replica");
+  ctx.check(refused.error().code == ErrorCode::ILLEGAL_TRANSITION,
+            "reported as an illegal transition");
+
+  auto retired = world.fabric->query_replica(run.previous_owner);
+  ctx.check(retired.value().lifecycle == ReplicaLifecycle::RETIRED,
+            "the retired replica stays retired");
+  ctx.check(retired.value().authority == ReplicaAuthorityState::HISTORICAL,
+            "and keeps only historical authority");
+  auto owner = world.fabric->query_replica(run.current_owner);
+  ctx.check(owner.value().authority == ReplicaAuthorityState::AUTHORITATIVE_OWNER,
+            "the current owner keeps single-writer authority");
+}
+
+CCSF_CASE(migration, ownership_cannot_be_handed_to_a_quarantined_replica) {
+  HandedOver run = hand_ownership_from_a_to_b(ctx, 36);
+  World& world = *run.world;
+
+  ReplicaTransition quarantine;
+  quarantine.replica_id = run.previous_owner;
+  quarantine.expected_coordinator_epoch = world.epoch();
+  quarantine.reason = "suspected damage";
+  ctx.check(world.fabric->quarantine_replica(quarantine).has_value(),
+            "the previous owner is quarantined");
+
+  auto refused = world.fabric->transfer_ownership(hand_back(run));
+  ctx.check(!refused.has_value(), "ownership cannot be handed to a quarantined replica");
+  ctx.check(refused.error().code == ErrorCode::FENCED, "reported as FENCED");
+
+  auto fenced = world.fabric->query_replica(run.previous_owner);
+  ctx.check(fenced.value().lifecycle == ReplicaLifecycle::QUARANTINED,
+            "the quarantined replica stays quarantined");
+  ctx.check(fenced.value().authority == ReplicaAuthorityState::FENCED, "and stays fenced");
+  ctx.check(!replica_counts_toward_replication_factor(fenced.value()),
+            "and does not count toward the replication factor");
+  auto owner = world.fabric->query_replica(run.current_owner);
+  ctx.check(owner.value().authority == ReplicaAuthorityState::AUTHORITATIVE_OWNER,
+            "the current owner keeps single-writer authority");
+}

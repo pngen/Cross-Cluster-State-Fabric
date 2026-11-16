@@ -433,6 +433,28 @@ Result<StateGenerationRecord> Fabric::commit_state_generation(StateId state_id,
                             "a state generation cannot become current from lifecycle " +
                                 std::string(to_string(existing->lifecycle)));
         }
+        // A generation that has been superseded is history. Committing it again
+        // would make it current a second time and supersede the generation that
+        // replaced it, together with every replica of that generation. The
+        // duplicate of the commit that was applied is acknowledged without effect.
+        if (existing->lifecycle == StateGenerationLifecycle::HISTORICAL ||
+            existing->lifecycle == StateGenerationLifecycle::SUPERSEDED) {
+          *out = *existing;
+          if (existing->commit.valid() && existing->commit == commit_id) {
+            return Status{};
+          }
+          return make_error(ErrorCode::ILLEGAL_TRANSITION,
+                            "a state generation cannot become current from lifecycle " +
+                                std::string(to_string(existing->lifecycle)));
+        }
+        // Every transfer and verification of this generation is checked against
+        // its content digest. Without one nothing could be checked, and any bytes
+        // would verify.
+        if (!existing->content_digest.valid()) {
+          return make_error(ErrorCode::INTEGRITY_UNKNOWN,
+                            "a state generation cannot become current before its content "
+                            "digest is known");
+        }
 
         std::vector<StateGenerationRecord> superseded;
         std::uint32_t other_current_non_branch = 0;

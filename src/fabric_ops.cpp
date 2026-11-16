@@ -902,6 +902,35 @@ Result<OwnershipRecord> Fabric::transfer_ownership(const OwnershipTransferReques
           return make_error(ErrorCode::STALE_REPLICA_GENERATION,
                             "the new owner replica generation is superseded");
         }
+        // Evidence that was verified once is not enough: a replica that has since
+        // been retired, fenced or flagged for revalidation holds no authority to
+        // receive, and a handover must not hand it back.
+        if (new_owner->is_terminal()) {
+          return make_error(ErrorCode::ILLEGAL_TRANSITION,
+                            std::string("the new owner replica is ") +
+                                to_string(new_owner->lifecycle) + " and can hold no authority");
+        }
+        if (new_owner->authority == ReplicaAuthorityState::FENCED ||
+            new_owner->lifecycle == ReplicaLifecycle::QUARANTINED ||
+            new_owner->lifecycle == ReplicaLifecycle::STALE) {
+          return make_error(ErrorCode::FENCED,
+                            "the new owner replica is fenced and cannot take ownership");
+        }
+        if (new_owner->evidence.revalidation_required) {
+          return make_error(ErrorCode::REVALIDATION_REQUIRED,
+                            "the new owner replica requires revalidation before it can take "
+                            "ownership");
+        }
+        switch (new_owner->lifecycle) {
+          case ReplicaLifecycle::PREPARED:
+          case ReplicaLifecycle::AUTHORITATIVE:
+          case ReplicaLifecycle::DEGRADED:
+            break;
+          default:
+            return make_error(ErrorCode::AUTHORITY_NOT_ESTABLISHED,
+                              std::string("a replica in lifecycle ") +
+                                  to_string(new_owner->lifecycle) + " cannot take ownership");
+        }
         if (new_owner->integrity != ReplicaIntegrityState::VERIFIED ||
             new_owner->compatibility != ReplicaCompatibilityState::COMPATIBLE) {
           return make_error(ErrorCode::AUTHORITY_NOT_ESTABLISHED,

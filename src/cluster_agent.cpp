@@ -222,32 +222,38 @@ void ClusterAgent::data_loop() {
     if (!accepted) {
       return;
     }
-    std::size_t active = 0;
+    std::shared_ptr<TcpConnection> connection = std::move(accepted.value());
     {
       std::lock_guard<std::mutex> guard(thread_mutex_);
-      active = active_data_connections_;
-      if (active >= config_.maximum_data_connections) {
-        accepted.value()->close();
+      if (stopping_ || active_data_connections_ >= config_.maximum_data_connections) {
+        connection->close();
         continue;
       }
       ++active_data_connections_;
+      open_data_connections_.push_back(connection);
     }
-    std::unique_ptr<TcpConnection> connection = std::move(accepted.value());
-    std::thread worker([this, connection = std::move(connection)]() mutable {
-      handle_data_connection(std::move(connection));
+    // The worker uses this agent until it has announced, under the lock, that
+    // its connection has ended; serve() waits for that announcement.
+    std::thread worker([this, connection]() {
+      handle_data_connection(*connection);
       std::lock_guard<std::mutex> guard(thread_mutex_);
+      connection->close();
+      open_data_connections_.erase(std::remove(open_data_connections_.begin(),
+                                               open_data_connections_.end(), connection),
+                                   open_data_connections_.end());
       if (active_data_connections_ > 0) {
         --active_data_connections_;
       }
       ++data_connections_;
+      data_idle_.notify_all();
     });
     worker.detach();
   }
 }
 
-void ClusterAgent::handle_data_connection(std::unique_ptr<TcpConnection> connection) {
+void ClusterAgent::handle_data_connection(TcpConnection& connection) {
   for (;;) {
-    auto frame = connection->receive_frame(config_.maximum_payload_bytes);
+    auto frame = connection.receive_frame(config_.maximum_payload_bytes);
     if (!frame) {
       return;
     }
@@ -271,7 +277,7 @@ void ClusterAgent::handle_data_connection(std::unique_ptr<TcpConnection> connect
         Frame reply;
         reply.header.message_type = MessageType::DATA_CHUNK;
         reply.payload = writer.data();
-        (void)connection->send_frame(reply);
+        (void)connection.send_frame(reply);
         return;
       }
       std::uint64_t offset = request.offset;
@@ -294,7 +300,7 @@ void ClusterAgent::handle_data_connection(std::unique_ptr<TcpConnection> connect
         Frame reply;
         reply.header.message_type = MessageType::DATA_CHUNK;
         reply.payload = writer.data();
-        Status sent = connection->send_frame(reply);
+        Status sent = connection.send_frame(reply);
         if (!sent) {
           return;
         }
@@ -325,7 +331,7 @@ void ClusterAgent::handle_data_connection(std::unique_ptr<TcpConnection> connect
       Frame reply;
       reply.header.message_type = MessageType::HOST_STATE_ACK;
       reply.payload = writer.data();
-      (void)connection->send_frame(reply);
+      (void)connection.send_frame(reply);
       continue;
     }
     return;
@@ -650,13 +656,25 @@ Result<void> ClusterAgent::serve() {
     listener_->close();
   }
   data_worker.join();
+  {
+    // Data connections are served on threads of their own that use this
+    // agent. They are ended and waited for here, so that the agent is never
+    // destroyed under one of them.
+    std::unique_lock<std::mutex> guard(thread_mutex_);
+    for (const std::shared_ptr<TcpConnection>& connection : open_data_connections_) {
+      connection->interrupt();
+    }
+    data_idle_.wait(guard, [this]() { return active_data_connections_ == 0; });
+  }
   return outcome;
 }
 
 void ClusterAgent::request_stop() {
   stopping_ = true;
   if (control_ != nullptr) {
-    control_->close();
+    // The control loop owns the connection and may be blocked in a receive on
+    // it: it is interrupted, not closed under that receive.
+    control_->interrupt();
   }
   if (listener_ != nullptr) {
     listener_->close();

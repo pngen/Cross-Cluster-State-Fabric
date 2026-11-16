@@ -238,9 +238,12 @@ ConstraintOutcome evaluate_hard_constraints(const PlacementCandidate& candidate,
                   ErrorCode::INTEGRITY_UNKNOWN);
   }
   if (constraints.minimum_durability != DurabilityClass::UNKNOWN) {
+    // The floor is a floor at every level: a destination that can establish
+    // DURABLE does not meet an ARCHIVAL requirement.
     const bool sufficient =
-        candidate.achievable_durability == ReplicaDurabilityState::DURABLE ||
         candidate.achievable_durability == ReplicaDurabilityState::ARCHIVAL ||
+        (constraints.minimum_durability <= DurabilityClass::DURABLE &&
+         candidate.achievable_durability == ReplicaDurabilityState::DURABLE) ||
         (constraints.minimum_durability <= DurabilityClass::STANDARD &&
          candidate.achievable_durability == ReplicaDurabilityState::STANDARD);
     if (!sufficient) {

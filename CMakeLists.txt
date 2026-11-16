@@ -152,6 +152,13 @@ if(CROSS_CLUSTER_STATE_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
+    # Build for the device that is present. Left to itself the compiler also
+    # targets architectures it has deprecated and warns about them on every
+    # build. This has to be decided before the language is enabled, because
+    # enabling it defines the variable with the compiler's own default.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures to build for")
+    endif()
     enable_language(CUDA)
     add_subdirectory(cuda)
   else()
